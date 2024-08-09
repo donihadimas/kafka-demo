@@ -1,63 +1,45 @@
 package main
 
 import (
-	"context"
+	"database/sql"
+	"fmt"
 	"go-kafka/config"
 	"go-kafka/consumer"
-	"go-kafka/handler"
 	"go-kafka/processor"
-	"go-kafka/producer"
-	"go-kafka/utils"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
-func main2() {
-	brokers := []string{"localhost:9092"}
-	groupID := "your-group-id"
-	topics := []string{"your-topic"}
+func main() {
+	r := gin.Default()
 
-	conn, err := config.ConnectDB()
+	brokers := []string{"localhost:9092"}
+	producer := config.NewKafkaProducer(brokers)
+	defer producer.Close()
+
+	db, err := sql.Open("postgres", "user=postgres password=hadimas dbname=kafka-explore sslmode=disable")
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	defer conn.Close(context.Background())
+	fmt.Println(`[main2.go] [main] -> Connected to PostgreSQL Database`)
+	defer db.Close()
 
-	producer := producer.NewKafkaProducer(brokers)
-	defer producer.Close()
+	consumer.NewKafkaConsumer(brokers, "your_group_id", "your_topic", db)
 
-	batches, err := processor.ProcessAndSplitExcel("yourfile.xlsx", 100)
-	if err != nil {
-		log.Fatalf("Failed to process Excel file: %v", err)
-	}
-
-	utils.SendBatchesToKafka(producer, "your-topic", batches, 100)
-
-	consumerGroup, err := consumer.NewKafkaConsumer2(brokers, groupID, topics)
-	if err != nil {
-		log.Fatalf("Failed to start Kafka consumer group: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	consumer := handler.ConsumerGroupHandler{conn: conn}
-
-	go func() {
-		for {
-			if err := consumerGroup.Consume(ctx, topics, consumer); err != nil {
-				log.Fatalf("Error from consumer: %v", err)
-			}
+	r.POST("/upload", func(c *gin.Context) {
+		file, _ := c.FormFile("file")
+		filePath := "./" + file.Filename
+		if err := c.SaveUploadedFile(file, filePath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+			return
 		}
-	}()
+		go processor.ProcessExcelFile(filePath, producer, "your_topic")
+		c.JSON(http.StatusOK, gin.H{"status": "File uploaded successfully"})
+	})
 
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
-	<-sigterm
-
-	if err = consumerGroup.Close(); err != nil {
-		log.Fatalf("Error closing consumer group: %v", err)
+	if err := r.Run(":9090"); err != nil {
+		log.Fatalf("Failed to run server: %v", err)
 	}
 }
